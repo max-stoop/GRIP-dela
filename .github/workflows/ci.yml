@@ -1,0 +1,115 @@
+name: CI
+
+# Een push naar main controleert en zet neer op test (test.yml); deze workflow draait dan niet, zodat elke wijziging maar
+# één ronde Actions-minuten kost. Deze workflow controleert op GitHub:
+#   * elk pull request: lint, typecheck, alle unit-tests (ook het gelijktijdig opslaan met twee echte
+#     databaseverbindingen, op een Postgres-server) en de build;
+#   * de end-to-end-tests (lang): bij een pull request, elke maandag en met de hand (Actions > CI > Run workflow).
+
+on:
+  pull_request:
+  schedule:
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Lint, typecheck, unit tests en build
+    runs-on: ubuntu-24.04
+    # Tijdslimieten: zonder limiet mag een hangende job 6 uur doorlopen, en de Actions-minuten van het account
+    # zijn gedeeld met de andere privé repositories (ook de dagelijkse Garmin-verversing van tri-dashboard).
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      # voor de tests met twee echte, gelijktijdige databaseverbindingen (__tests__/database/gelijktijdig.test.ts)
+      GRIP_TEST_PG: postgres://postgres:postgres@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Lint
+        run: npm run lint
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Unit tests (PGlite en een echte Postgres)
+        run: npm test
+      - name: Build
+        run: npm run build
+      # de template van Azure compileren, met een vaste versie: een fout erin komt anders pas bij het installatiescript
+      # aan het licht
+      - name: Azure-template (Bicep)
+        run: az bicep install --version v0.49.2 && az bicep build --file azure/main.bicep --stdout > /dev/null
+
+  e2e:
+    name: End-to-end (Playwright)
+    if: github.event_name == 'pull_request' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+      - name: Build
+        run: npm run build
+      - name: End-to-end tests (lokale modus)
+        run: npm run test:e2e
+      - name: Rapport bewaren bij een fout
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 7
+
+  e2e-azure:
+    name: End-to-end in Azure-modus (Postgres en nagebootste Entra ID)
+    if: github.event_name == 'pull_request' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      GRIP_TEST_PG: postgres://postgres:postgres@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+      - name: Build voor Azure
+        run: npm run build:azure
+      - name: End-to-end tests (Azure)
+        run: npm run test:e2e:azure

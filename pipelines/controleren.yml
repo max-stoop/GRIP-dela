@@ -1,0 +1,100 @@
+# Alles wat zonder de omgevingen van DELA kan, op een gewone agent van Microsoft.
+jobs:
+  - job: code
+    displayName: Lint, typecheck, unit-tests en pakket
+    pool: { vmImage: ubuntu-24.04 }
+    timeoutInMinutes: 30
+    services:
+      postgres: postgres
+    variables:
+      # ook de tests met twee echte, gelijktijdige databaseverbindingen
+      GRIP_TEST_PG: postgres://postgres:postgres@localhost:5432/postgres
+    steps:
+      - task: NodeTool@0
+        inputs: { versionSpec: $(nodeVersie) }
+      - script: npm ci
+        displayName: Afhankelijkheden
+      - script: npm run lint
+        displayName: Lint
+      - script: npm run typecheck
+        displayName: Typecheck
+      - script: npx vitest run --reporter=default --reporter=junit --outputFile.junit=test-results/unit.xml
+        displayName: Unit-tests
+      - task: PublishTestResults@2
+        condition: succeededOrFailed()
+        inputs: { testResultsFormat: JUnit, testResultsFiles: test-results/unit.xml, testRunTitle: Unit-tests }
+      - script: npm run build:dela
+        displayName: Bouwen voor Azure (DELA)
+        env:
+          GRIP_VERSIE: $(Build.SourceVersion)
+      - task: ArchiveFiles@2
+        displayName: Inpakken
+        inputs:
+          rootFolderOrFile: .next-azure/standalone
+          includeRootFolder: false
+          archiveType: zip
+          archiveFile: $(Build.ArtifactStagingDirectory)/app/grip.zip
+      - task: CopyFiles@2
+        displayName: Infrastructuur en rooktest erbij
+        inputs:
+          contents: |
+            infra/**
+            e2e/rook/**
+            playwright.rook.config.ts
+            package.json
+            package-lock.json
+          targetFolder: $(Build.ArtifactStagingDirectory)/app
+      - publish: $(Build.ArtifactStagingDirectory)/app
+        artifact: grip
+
+  - job: e2e
+    displayName: End-to-end (lokale modus en Azure-modus)
+    pool: { vmImage: ubuntu-24.04 }
+    timeoutInMinutes: 45
+    services:
+      postgres: postgres
+    variables:
+      GRIP_TEST_PG: postgres://postgres:postgres@localhost:5432/postgres
+      CI: 'true'
+    steps:
+      - task: NodeTool@0
+        inputs: { versionSpec: $(nodeVersie) }
+      - script: npm ci && npx playwright install --with-deps chromium
+        displayName: Afhankelijkheden en Chromium
+      - script: npm run build && npm run test:e2e
+        displayName: End-to-end (lokale modus)
+      - script: npm run build:azure && npm run test:e2e:azure
+        displayName: End-to-end (Azure-modus, nagebootste Entra ID)
+      - publish: test-results
+        artifact: playwright-$(System.JobAttempt)
+        condition: failed()
+
+  - job: security
+    displayName: Security-scans
+    pool: { vmImage: ubuntu-24.04 }
+    timeoutInMinutes: 20
+    steps:
+      - checkout: self
+        fetchDepth: 0
+      - task: NodeTool@0
+        inputs: { versionSpec: $(nodeVersie) }
+      - script: npm ci --ignore-scripts && npm audit --omit=dev --audit-level=high
+        displayName: Kwetsbare afhankelijkheden (npm audit)
+      - script: |
+          docker run --rm -v "$(Build.SourcesDirectory):/repo" zricethezav/gitleaks:v8.24.2 \
+            detect --source /repo --redact --no-banner --report-format sarif --report-path /repo/gitleaks.sarif
+        displayName: Geheimen in de code en de geschiedenis (gitleaks)
+      - script: |
+          docker run --rm -v "$(Build.SourcesDirectory):/src" semgrep/semgrep:1.110.0 \
+            semgrep scan --config p/typescript --config p/nodejs --config p/react --config p/owasp-top-ten \
+            --severity ERROR --error --sarif --output /src/semgrep.sarif --exclude node_modules --exclude __tests__ --exclude e2e
+        displayName: Static code analysis (Semgrep)
+      - script: az bicep build --file infra/main.bicep --stdout > /dev/null && az bicep lint --file infra/main.bicep
+        displayName: Bicep controleren
+      - task: CopyFiles@2
+        condition: succeededOrFailed()
+        inputs: { contents: '*.sarif', targetFolder: $(Build.ArtifactStagingDirectory)/security }
+      - publish: $(Build.ArtifactStagingDirectory)/security
+        artifact: CodeAnalysisLogs
+        condition: succeededOrFailed()
+        displayName: Rapporten bewaren (SARIF)

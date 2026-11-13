@@ -1,0 +1,93 @@
+name: Naar productie
+
+# Met de hand, als de versie op test goed is: Actions > Naar productie > Run workflow. Zet precies de versie neer die op
+# test draait (dezelfde commit), en alleen na alle controles, ook de end-to-end-tests. Zo komt er niets op productie
+# dat niet eerst op test heeft gestaan. Een push naar main verandert productie niet.
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: productie
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AZURE_CLIENT_ID: 44923043-3904-4e42-850d-ab7495d20279
+  AZURE_TENANT_ID: 1327189d-a9df-4e2f-8d3c-bc6a502f45cc
+  AZURE_SUBSCRIPTION_ID: 69f06b72-f7f3-457c-aeb2-11be1f7fce22
+  RESOURCEGROEP: grip
+  APP: grip-qopmw2zw33qm2
+  TEST_APP: grip-test-qopmw2zw33qm2
+
+jobs:
+  productie:
+    name: De versie van test naar productie
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      GRIP_TEST_PG: postgres://postgres:postgres@localhost:5432/postgres
+    steps:
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+      - name: Welke versie staat op test
+        id: test
+        run: |
+          adres="https://$(az webapp show -g "$RESOURCEGROEP" -n "$TEST_APP" --query defaultHostName -o tsv)/api/versie"
+          versie=$(curl -fsS "$adres" | jq -r .versie) || true
+          if [[ ! $versie =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Op test staat geen versie uit GitHub ($versie). Zet eerst een versie op test."
+            exit 1
+          fi
+          echo "versie=$versie" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.test.outputs.versie }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: npm
+      - run: npm ci
+      - name: Lint, typecheck en unit-tests
+        run: npm run lint && npm run typecheck && npm test
+      - name: Bouwen voor Azure
+        run: npm run build:azure
+        env:
+          GRIP_VERSIE: ${{ steps.test.outputs.versie }}
+      # inpakken voor de end-to-end-tests: die starten de gebouwde app, en wat die dan wegschrijft hoort niet in het pakket
+      - name: Inpakken
+        run: cd .next-azure/standalone && zip -qr "$GITHUB_WORKSPACE/app.zip" .
+      - name: Chromium voor de end-to-end-tests
+        run: npx playwright install --with-deps chromium
+      - name: End-to-end-tests (de app zoals in Azure)
+        run: npm run test:e2e:azure
+      - name: Neerzetten op productie
+        run: az webapp deploy --resource-group "$RESOURCEGROEP" --name "$APP" --src-path app.zip --type zip
+      - name: Draait de nieuwe versie
+        env:
+          VERSIE: ${{ steps.test.outputs.versie }}
+        run: |
+          adres="https://$(az webapp show -g "$RESOURCEGROEP" -n "$APP" --query defaultHostName -o tsv)/api/versie"
+          for _ in $(seq 30); do
+            if [[ $(curl -fsS "$adres" | jq -r .versie) == "$VERSIE" ]]; then
+              echo "Op productie staat nu $VERSIE, dezelfde versie als op test." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::Productie draait na vijf minuten nog niet de nieuwe versie."
+          exit 1

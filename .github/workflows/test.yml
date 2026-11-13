@@ -1,0 +1,80 @@
+name: Naar test
+
+# Elke push naar main: controleren, bouwen en neerzetten op de testomgeving (test.gripapp.nl, met een eigen database).
+# Productie verandert hier niet; dat gaat met 'Naar productie' (productie.yml), na akkoord op test. Mislukt een
+# controle, dan blijft de vorige versie op test staan.
+# Inloggen bij Azure gaat zonder wachtwoord (OIDC). De waarden hieronder zijn geen geheimen: Azure vertrouwt alleen deze
+# repository op main, en alleen voor deze twee apps (azure/installeer.sh met GITHUB=...).
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**/*.md', 'docs/**']
+  workflow_dispatch:
+
+# een nieuwe uitrol wacht tot de vorige klaar is, in plaats van hem halverwege af te breken
+concurrency:
+  group: test
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AZURE_CLIENT_ID: 44923043-3904-4e42-850d-ab7495d20279
+  AZURE_TENANT_ID: 1327189d-a9df-4e2f-8d3c-bc6a502f45cc
+  AZURE_SUBSCRIPTION_ID: 69f06b72-f7f3-457c-aeb2-11be1f7fce22
+  RESOURCEGROEP: grip
+  TEST_APP: grip-test-qopmw2zw33qm2
+
+jobs:
+  test:
+    name: Controleren, bouwen en neerzetten op test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      # ook de tests met twee echte, gelijktijdige databaseverbindingen (__tests__/database/gelijktijdig.test.ts)
+      GRIP_TEST_PG: postgres://postgres:postgres@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: npm
+      - run: npm ci
+      - name: Lint, typecheck en unit-tests
+        run: npm run lint && npm run typecheck && npm test
+      - name: Bouwen voor Azure
+        run: npm run build:azure
+        env:
+          GRIP_VERSIE: ${{ github.sha }}
+      - name: Inpakken
+        run: cd .next-azure/standalone && zip -qr "$GITHUB_WORKSPACE/app.zip" .
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+      - name: Neerzetten op test
+        run: az webapp deploy --resource-group "$RESOURCEGROEP" --name "$TEST_APP" --src-path app.zip --type zip
+      - name: Draait de nieuwe versie
+        run: |
+          adres="https://$(az webapp show -g "$RESOURCEGROEP" -n "$TEST_APP" --query defaultHostName -o tsv)/api/versie"
+          for _ in $(seq 30); do
+            if [[ $(curl -fsS "$adres" | jq -r .versie) == "$GITHUB_SHA" ]]; then
+              echo "Op test staat nu $GITHUB_SHA. Goed? Dan Actions > Naar productie > Run workflow." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::De testomgeving draait na vijf minuten nog niet de nieuwe versie."
+          exit 1

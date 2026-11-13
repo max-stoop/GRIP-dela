@@ -1,0 +1,80 @@
+# GRIP in Azure DevOps: controleren, bouwen en via OTAP uitrollen naar de landing zone van DELA.
+#
+#   Controleren ─► dev ─► tst ─► acc ─► prd
+#
+# - Controleren: lint, typecheck, unit-tests (ook op Postgres), end-to-end-tests, security-scans en het pakket.
+# - Elke omgeving: eerst de infrastructuur (infra/main.bicep), dan de app, dan een rooktest. Op tst ook een
+#   security-scan van de draaiende app (OWASP ZAP).
+# - Akkoord voor acc en prd stel je in bij de Environments grip-acc en grip-prd (Approvals and checks).
+# - Productie alleen vanaf main. Elke omgeving krijgt precies hetzelfde pakket.
+#
+# Vooraf in Azure DevOps: de service connections grippapp-<omgeving>-we-scn (zijn er), de Environments grip-dev,
+# grip-tst, grip-acc en grip-prd, de variabelengroepen grip-dev ... grip-prd (zie pipelines/README.md) en een agent pool
+# die in het VNet draait (parameter uitrolPool): de app en de database zijn alleen van binnen het netwerk bereikbaar.
+
+trigger:
+  branches:
+    include: [main]
+  paths:
+    exclude: ['**/*.md', 'docs/**']
+
+pr:
+  branches:
+    include: [main]
+
+parameters:
+  - name: uitrolPool
+    displayName: Agent pool in het VNet (voor uitrollen en de rooktest)
+    type: string
+    default: TODO-agent-pool-in-vnet
+  - name: tot
+    displayName: Uitrollen tot en met
+    type: string
+    default: prd
+    values: [geen, dev, tst, acc, prd]
+
+variables:
+  nodeVersie: 22.x
+
+resources:
+  containers:
+    - container: postgres
+      image: postgres:16
+      env: { POSTGRES_PASSWORD: postgres }
+      ports: ['5432:5432']
+
+stages:
+  - stage: controleren
+    displayName: Controleren en bouwen
+    jobs:
+      - template: pipelines/controleren.yml
+
+  - ${{ if and(ne(variables['Build.Reason'], 'PullRequest'), ne(parameters.tot, 'geen')) }}:
+    - template: pipelines/uitrol.yml
+      parameters:
+        omgeving: dev
+        vorige: controleren
+        pool: ${{ parameters.uitrolPool }}
+
+    - ${{ if in(parameters.tot, 'tst', 'acc', 'prd') }}:
+      - template: pipelines/uitrol.yml
+        parameters:
+          omgeving: tst
+          vorige: uitrol_dev
+          pool: ${{ parameters.uitrolPool }}
+          securityScan: true
+
+    - ${{ if in(parameters.tot, 'acc', 'prd') }}:
+      - template: pipelines/uitrol.yml
+        parameters:
+          omgeving: acc
+          vorige: uitrol_tst
+          pool: ${{ parameters.uitrolPool }}
+
+    - ${{ if eq(parameters.tot, 'prd') }}:
+      - template: pipelines/uitrol.yml
+        parameters:
+          omgeving: prd
+          vorige: uitrol_acc
+          pool: ${{ parameters.uitrolPool }}
+          alleenMain: true

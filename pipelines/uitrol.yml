@@ -1,0 +1,115 @@
+# Eén omgeving uitrollen: infrastructuur, app, rooktest (en op tst een security-scan van de draaiende app).
+# Draait op een agent in het VNet: de app (ook de uitrol-endpoint) en de database zijn alleen van binnen bereikbaar.
+parameters:
+  - name: omgeving
+    type: string
+  - name: vorige
+    type: string
+  - name: pool
+    type: string
+  - name: securityScan
+    type: boolean
+    default: false
+  - name: alleenMain
+    type: boolean
+    default: false
+
+stages:
+  - stage: uitrol_${{ parameters.omgeving }}
+    displayName: Naar ${{ parameters.omgeving }}
+    dependsOn: ${{ parameters.vorige }}
+    ${{ if parameters.alleenMain }}:
+      condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    variables:
+      # ENTRA_TENANT_ID, ENTRA_CLIENT_ID, ENTRA_CLIENT_SECRET, SESSIE_GEHEIM, DATABASE_WACHTWOORD, GRIP_BEHEERDER,
+      # RESOURCEGROEP en eventueel MELDINGEN_AAN en LOG_ANALYTICS_ID; zie pipelines/README.md
+      - group: grip-${{ parameters.omgeving }}
+      - name: serviceConnection
+        value: grippapp-${{ parameters.omgeving }}-we-scn
+    jobs:
+      - deployment: uitrol
+        displayName: Infrastructuur, app en rooktest
+        environment: grip-${{ parameters.omgeving }}
+        pool: ${{ parameters.pool }}
+        timeoutInMinutes: 60
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: current
+                  artifact: grip
+
+                - task: AzureCLI@2
+                  name: infra
+                  displayName: Infrastructuur (Bicep)
+                  inputs:
+                    azureSubscription: $(serviceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    workingDirectory: $(Pipeline.Workspace)/grip
+                    inlineScript: |
+                      set -euo pipefail
+                      # een variabele die niet in de groep staat, komt hier letterlijk als $(NAAM) binnen
+                      for v in MELDINGEN_AAN LOG_ANALYTICS_ID; do [[ ${!v:-} == '$('* ]] && unset "$v"; done
+                      uit=$(az deployment group create --resource-group "$RESOURCEGROEP" --name "grip-$(Build.BuildId)" \
+                        --parameters infra/omgevingen/${{ parameters.omgeving }}.bicepparam --query properties.outputs -o json)
+                      echo "##vso[task.setvariable variable=appNaam;isOutput=true]$(jq -r .appNaam.value <<<"$uit")"
+                      echo "##vso[task.setvariable variable=appAdres;isOutput=true]$(jq -r .appAdres.value <<<"$uit")"
+                      echo "Terugadres voor de app-registratie: $(jq -r .terugAdres.value <<<"$uit")"
+                  env:
+                    RESOURCEGROEP: $(RESOURCEGROEP)
+                    ENTRA_TENANT_ID: $(ENTRA_TENANT_ID)
+                    ENTRA_CLIENT_ID: $(ENTRA_CLIENT_ID)
+                    ENTRA_CLIENT_SECRET: $(ENTRA_CLIENT_SECRET)
+                    SESSIE_GEHEIM: $(SESSIE_GEHEIM)
+                    DATABASE_WACHTWOORD: $(DATABASE_WACHTWOORD)
+                    GRIP_BEHEERDER: $(GRIP_BEHEERDER)
+                    MELDINGEN_AAN: $(MELDINGEN_AAN)
+                    LOG_ANALYTICS_ID: $(LOG_ANALYTICS_ID)
+
+                - task: AzureWebApp@1
+                  displayName: App neerzetten
+                  inputs:
+                    azureSubscription: $(serviceConnection)
+                    appType: webAppLinux
+                    appName: $(infra.appNaam)
+                    package: $(Pipeline.Workspace)/grip/grip.zip
+                    deploymentMethod: zipDeploy
+                    startUpCommand: node server.js
+
+                - script: |
+                    set -euo pipefail
+                    for _ in $(seq 30); do
+                      if [[ $(curl -fsS "$(infra.appAdres)/api/versie" | jq -r .versie) == "$(Build.SourceVersion)" ]]; then
+                        echo "Op ${{ parameters.omgeving }} draait nu $(Build.SourceVersion)."; exit 0
+                      fi
+                      sleep 10
+                    done
+                    echo "##vso[task.logissue type=error]${{ parameters.omgeving }} draait na vijf minuten nog niet de nieuwe versie."; exit 1
+                  displayName: Draait de nieuwe versie
+
+                - script: npm ci --ignore-scripts && npx playwright install --with-deps chromium && npm run test:rook
+                  displayName: Rooktest
+                  workingDirectory: $(Pipeline.Workspace)/grip
+                  env:
+                    CI: 'true'
+                    GRIP_ADRES: $(infra.appAdres)
+                    GRIP_VERSIE: $(Build.SourceVersion)
+
+                - task: PublishTestResults@2
+                  condition: succeededOrFailed()
+                  inputs:
+                    testResultsFormat: JUnit
+                    testResultsFiles: $(Pipeline.Workspace)/grip/test-results/rook.xml
+                    testRunTitle: Rooktest ${{ parameters.omgeving }}
+
+                - ${{ if parameters.securityScan }}:
+                  - script: |
+                      mkdir -p zap && chmod 777 zap
+                      docker run --rm -v "$PWD/zap:/zap/wrk" ghcr.io/zaproxy/zaproxy:2.16.1 \
+                        zap-baseline.py -t "$(infra.appAdres)" -r zap.html -x zap.xml -I
+                    displayName: Security-scan van de draaiende app (OWASP ZAP baseline)
+                    workingDirectory: $(Pipeline.Workspace)
+                  - publish: $(Pipeline.Workspace)/zap
+                    artifact: zap-${{ parameters.omgeving }}-$(System.JobAttempt)
+                    condition: succeededOrFailed()
